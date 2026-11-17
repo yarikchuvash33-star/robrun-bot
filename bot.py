@@ -1,5 +1,5 @@
-
 import os
+import io
 import asyncio
 import sqlite3
 from datetime import datetime
@@ -9,7 +9,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
-    Message, CallbackQuery,
+    Message, CallbackQuery, BufferedInputFile,
     InlineKeyboardMarkup, InlineKeyboardButton
 )
 
@@ -55,6 +55,10 @@ def init_db():
         """)
 
 
+def is_admin(user_id):
+    return user_id == ADMIN_ID
+
+
 def main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -66,6 +70,14 @@ def main_menu():
         [InlineKeyboardButton(
             text="📦 Мои заказы", callback_data="history"
         )]
+    ])
+
+
+def admin_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="📋 Заказы", callback_data="adm:orders:0")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm:broadcast")],
     ])
 
 
@@ -173,6 +185,158 @@ async def stop_input(message: Message):
         "Ввод отменён. Возвращаемся в меню.",
         reply_markup=main_menu()
     )
+
+
+# ============ АДМИНКА ============
+
+@dp.message(Command("admin"))
+async def admin_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu(), parse_mode="HTML")
+
+
+@dp.message(Command("backup"))
+async def backup_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    with db() as con:
+        rows = con.execute("""
+            SELECT id, user_id, username, order_type, amount, server, status, created_at
+            FROM orders ORDER BY id
+        """).fetchall()
+    if not rows:
+        return await message.answer("Заказов нет.")
+    buf = io.StringIO()
+    buf.write("id,user_id,username,order_type,amount,server,status,created_at\n")
+    for r in rows:
+        buf.write(",".join(str(x).replace(",", ";") for x in r) + "\n")
+    buf.seek(0)
+    file = BufferedInputFile(buf.read().encode(), filename="orders_backup.csv")
+    await message.answer_document(file, caption=f"📦 Бэкап, {len(rows)} заказов")
+
+
+@dp.callback_query(F.data == "adm:stats")
+async def adm_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    with db() as con:
+        total = con.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+        new = con.execute("SELECT COUNT(*) FROM orders WHERE status='Новый'").fetchone()[0]
+        done = con.execute("SELECT COUNT(*) FROM orders WHERE status='Выполнен'").fetchone()[0]
+        cancelled = con.execute("SELECT COUNT(*) FROM orders WHERE status='Отменён'").fetchone()[0]
+    text = (
+        "📊 <b>СТАТИСТИКА</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🧾 Всего заказов: <b>{total}</b>\n"
+        f"🟡 Новых: <b>{new}</b>\n"
+        f"🟢 Выполнено: <b>{done}</b>\n"
+        f"🔴 Отменено: <b>{cancelled}</b>"
+    )
+    await call.message.answer(text, parse_mode="HTML", reply_markup=admin_menu())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:orders:"))
+async def adm_orders(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    with db() as con:
+        rows = con.execute("""
+            SELECT id, username, order_type, status
+            FROM orders ORDER BY id DESC LIMIT 10
+        """).fetchall()
+    if not rows:
+        return await call.answer("Заказов нет", show_alert=True)
+    kb = []
+    for oid, uname, kind, st in rows:
+        e = {"Новый": "🟡", "Выполнен": "🟢", "Отменён": "🔴"}.get(st, "⚪")
+        kb.append([InlineKeyboardButton(
+            text=f"{e} #{oid} @{uname or '—'} — {kind[:20]}",
+            callback_data=f"adm:order:{oid}"
+        )])
+    kb.append([InlineKeyboardButton(text="⬅️ Меню", callback_data="adm:menu")])
+    await call.message.answer(
+        "📋 <b>Заказы</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+        parse_mode="HTML"
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:order:"))
+async def adm_order_view(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    oid = int(call.data.split(":")[2])
+    with db() as con:
+        row = con.execute("""
+            SELECT user_id, username, order_type, amount, server, status, created_at
+            FROM orders WHERE id=?
+        """, (oid,)).fetchone()
+    if not row:
+        return await call.answer("Не найден", show_alert=True)
+    uid, uname, kind, amt, srv, st, date = row
+    text = (
+        f"🧾 <b>Заказ #{oid}</b>\n"
+        f"👤 @{uname or '—'} (<code>{uid}</code>)\n"
+        f"📌 {kind}\n"
+        f"💰 {amt or '—'}\n"
+        f"🌐 {srv}\n"
+        f"📅 {date}\n"
+        f"📊 Статус: <b>{st}</b>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 В работе", callback_data=f"adm:st:{oid}:В работе")],
+        [InlineKeyboardButton(text="✅ Выполнен", callback_data=f"adm:st:{oid}:Выполнен")],
+        [InlineKeyboardButton(text="❌ Отменён", callback_data=f"adm:st:{oid}:Отменён")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:orders:0")],
+    ])
+    await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm:st:"))
+async def adm_set_status(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    _, _, oid, new_st = call.data.split(":")
+    oid = int(oid)
+    with db() as con:
+        con.execute("UPDATE orders SET status=? WHERE id=?", (new_st, oid))
+        row = con.execute("SELECT user_id, order_type, server FROM orders WHERE id=?", (oid,)).fetchone()
+    if row:
+        uid, kind, srv = row
+        try:
+            await bot.send_message(
+                uid,
+                f"📢 <b>Статус заказа #{oid} изменён</b>\n\n"
+                f"📌 {kind}\n🌐 {srv}\n\n"
+                f"Новый статус: <b>{new_st}</b>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+    await call.answer(f"Статус: {new_st}", show_alert=True)
+
+
+@dp.callback_query(F.data == "adm:menu")
+async def adm_back(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer()
+    await call.message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu(), parse_mode="HTML")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm:broadcast")
+async def adm_broadcast(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("Нет доступа", show_alert=True)
+    users[call.from_user.id] = {"step": "adm_broadcast"}
+    await call.message.answer("📢 Отправь текст для рассылки. Отмена: /cancel")
+    await call.answer()
+
+# ============ КОНЕЦ АДМИНКИ ============
 
 
 @dp.callback_query(F.data == "home")
@@ -363,14 +527,29 @@ async def text_handler(message: Message):
 
     value = message.text.strip()
 
+    if data["step"] == "adm_broadcast":
+        if not is_admin(message.from_user.id):
+            return
+        with db() as con:
+            ids = [r[0] for r in con.execute("SELECT DISTINCT user_id FROM orders").fetchall()]
+        ok = fail = 0
+        for uid in ids:
+            try:
+                await bot.send_message(uid, message.text)
+                ok += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.05)
+        users.pop(message.from_user.id, None)
+        await message.answer(f"✅ Отправлено: {ok}\n❌ Ошибок: {fail}")
+        return
+
     if data["step"] == "manual":
         try:
             raw = value.lower().replace("млн", "").replace(" ", "")
             raw = raw.replace(",", ".")
             amount = Decimal(raw)
 
-            # Можно вводить количество в миллионах
-            # или полное количество виртов.
             if amount >= 500000:
                 amount = amount / Decimal("1000000")
 
@@ -469,3 +648,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
